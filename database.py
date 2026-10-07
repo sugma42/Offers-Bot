@@ -1,7 +1,20 @@
+import os
 import sqlite3
 from datetime import datetime, timedelta
 
-DB_NAME = "subscriptions.db"
+import config
+
+DB_NAME = config.DB_PATH
+
+
+def _ensure_dir():
+    """Создаёт папку для БД, если её нет (например, /data)."""
+    folder = os.path.dirname(os.path.abspath(DB_NAME))
+    if folder and not os.path.exists(folder):
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except Exception as e:
+            print(f"⚠️ Не удалось создать папку {folder}: {e}")
 
 
 def _conn():
@@ -9,6 +22,7 @@ def _conn():
 
 
 def init_db():
+    _ensure_dir()
     conn = _conn()
     cur = conn.cursor()
     cur.execute("""
@@ -41,7 +55,10 @@ def init_db():
 def get_user(user_id: int):
     conn = _conn()
     cur = conn.cursor()
-    cur.execute("SELECT user_id, username, subscription_until, total_paid FROM users WHERE user_id = ?", (user_id,))
+    cur.execute(
+        "SELECT user_id, username, subscription_until, total_paid FROM users WHERE user_id = ?",
+        (user_id,)
+    )
     row = cur.fetchone()
     conn.close()
     return row
