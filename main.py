@@ -1,0 +1,330 @@
+import asyncio
+import logging
+import time
+from datetime import datetime
+
+import aiohttp
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+import config
+import database as db
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+bot = Bot(token=config.BOT_TOKEN)
+dp = Dispatcher()
+
+PRICE_NANO = int(config.SUBSCRIPTION_PRICE * 1_000_000_000)
+TONCENTER_URL = "https://toncenter.com/api/v2/getTransactions"
+
+
+# ────────────────────────────────────────────────
+# Получение транзакций адреса Tonkeeper
+# ────────────────────────────────────────────────
+async def fetch_transactions(limit: int = 30):
+    params = {
+        "address": config.TONKEEPER_ADDRESS,
+        "limit": limit,
+        "archival": "false",
+    }
+    headers = {}
+    if config.TONCENTER_API_KEY:
+        headers["X-API-Key"] = config.TONCENTER_API_KEY
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(TONCENTER_URL, params=params, headers=headers, timeout=15) as resp:
+            data = await resp.json()
+
+    if not data.get("ok"):
+        raise RuntimeError(f"TonCenter error: {data}")
+    return data.get("result", [])
+
+
+# ────────────────────────────────────────────────
+# Поиск платежа конкретного пользователя
+# ────────────────────────────────────────────────
+async def find_user_payment(user_id: int, max_age_seconds: int = 3600):
+    """
+    Ищет входящую транзакцию на адрес Tonkeeper:
+    - сумма >= 5 TON
+    - комментарий == str(user_id)
+    - не старше max_age_seconds
+    - ещё не использованная
+    """
+    try:
+        txs = await fetch_transactions()
+    except Exception as e:
+        logging.error(f"Ошибка получения транзакций: {e}")
+        return None
+
+    now = int(time.time())
+    for tx in txs:
+        in_msg = tx.get("in_msg") or {}
+        value = int(in_msg.get("value", "0") or 0)
+        comment = (in_msg.get("message") or "").strip()
+        dest = in_msg.get("destination", "")
+
+        if not dest or not value:
+            continue
+        if value < PRICE_NANO:
+            continue
+        if comment != str(user_id):
+            continue
+
+        utime = int(tx.get("utime", 0))
+        if now - utime > max_age_seconds:
+            continue
+
+        tx_hash = tx.get("transaction_id", {}).get("hash")
+        if not tx_hash:
+            continue
+        if db.payment_exists(tx_hash):
+            continue
+
+        return {
+            "hash": tx_hash,
+            "amount_ton": value / 1e9,
+            "utime": utime,
+        }
+    return None
+
+
+# ────────────────────────────────────────────────
+# Клавиатуры
+# ────────────────────────────────────────────────
+def main_menu(is_active: bool = False):
+    kb = InlineKeyboardBuilder()
+    if is_active:
+        kb.button(text="🔄 Продлить подписку", callback_data="buy_sub")
+    else:
+        kb.button(text=f"💎 Купить подписку ({config.SUBSCRIPTION_PRICE:g} TON)", callback_data="buy_sub")
+    kb.button(text="👤 Мой профиль", callback_data="profile")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def pay_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Я оплатил — проверить", callback_data="check_payment")
+    kb.button(text="⬅️ Назад", callback_data="back")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+# ────────────────────────────────────────────────
+# Хендлеры
+# ────────────────────────────────────────────────
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    db.init_db()
+    active = db.is_subscribed(message.from_user.id)
+
+    text = (
+        f"👋 Привет, {message.from_user.full_name}!\n\n"
+        f"Это бот продажи подписки за **TON**.\n"
+        f"Средства поступают напрямую на кошелёк **Tonkeeper**.\n\n"
+    )
+
+    if active:
+        user = db.get_user(message.from_user.id)
+        until = datetime.fromisoformat(user[2]).strftime("%d.%m.%Y %H:%M")
+        text += f"✅ Ваша подписка активна до **{until}**\n\n"
+
+    text += "Выберите действие 👇"
+
+    await message.answer(text, reply_markup=main_menu(active), parse_mode="Markdown")
+
+
+@dp.callback_query(F.data == "buy_sub")
+async def buy_sub(callback: CallbackQuery):
+    user_id = callback.from_user.id
+
+    text = (
+        f"💎 **Подписка на {config.SUBSCRIPTION_DAYS} дней**\n\n"
+        f"💰 Стоимость: **{config.SUBSCRIPTION_PRICE:g} TON**\n\n"
+        f"📤 **Как оплатить:**\n"
+        f"1. Откройте кошелёк **Tonkeeper** (или любой TON-кошелёк)\n"
+        f"2. Переведите ровно **{config.SUBSCRIPTION_PRICE:g} TON** на адрес:\n"
+        f"`{config.TONKEEPER_ADDRESS}`\n\n"
+        f"3. В поле **«Комментарий»** обязательно укажите ваш ID:\n"
+        f"`{user_id}`\n\n"
+        f"⚠️ **Без комментария бот не сможет найти ваш платёж!**\n\n"
+        f"После отправки нажмите «Я оплатил» и подождите ~30 секунд, "
+        f"пока транзакция подтвердится в сети."
+    )
+
+    db.add_pending(user_id)
+
+    await callback.message.edit_text(
+        text, reply_markup=pay_menu(), parse_mode="Markdown"
+    )
+
+
+async def process_payment(user_id: int, username: str):
+    """Проверяет платёж и активирует подписку. Возвращает (успех, текст)."""
+    payment = await find_user_payment(user_id)
+
+    if not payment:
+        return False, (
+            "❌ **Платёж не найден.**\n\n"
+            "Проверьте:\n"
+            f"• Сумма перевода ровно **{config.SUBSCRIPTION_PRICE:g} TON**\n"
+            f"• Комментарий к переводу — `{user_id}`\n"
+            f"• Прошло ли хотя бы 30 секунд с момента отправки\n"
+            f"• Адрес получателя: `{config.TONKEEPER_ADDRESS}`\n\n"
+            "Если всё верно — подождите минуту и нажмите «Проверить» ещё раз."
+        )
+
+    tx_hash = payment["hash"]
+    amount = payment["amount_ton"]
+
+    db.save_payment(user_id, amount, tx_hash)
+    until = db.activate_subscription(
+        user_id, username, config.SUBSCRIPTION_DAYS, amount
+    )
+    db.remove_pending(user_id)
+
+    text = (
+        f"✅ **Оплата получена!**\n\n"
+        f"💰 Сумма: `{amount} TON`\n"
+        f"📅 Подписка активна до: `{until.strftime('%d.%m.%Y %H:%M')}`\n"
+        f"🔗 TX: `{tx_hash[:20]}...`\n\n"
+    )
+
+    if config.SUBSCRIBER_CHANNEL_LINK:
+        text += f"👉 Ссылка на закрытый канал:\n{config.SUBSCRIBER_CHANNEL_LINK}"
+    else:
+        text += "Спасибо за покупку! 🎉"
+
+    return True, text
+
+
+@dp.callback_query(F.data == "check_payment")
+async def check_payment(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    username = callback.from_user.username or callback.from_user.full_name
+
+    await callback.message.edit_text("🔍 Проверяю поступление на Tonkeeper...")
+
+    ok, text = await process_payment(user_id, username)
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=main_menu(ok) if ok else pay_menu(),
+        parse_mode="Markdown"
+    )
+
+
+@dp.callback_query(F.data == "profile")
+async def profile(callback: CallbackQuery):
+    user = db.get_user(callback.from_user.id)
+
+    if not user:
+        await callback.message.edit_text(
+            "❌ Вы ещё не покупали подписку.\n\nНажмите «Купить подписку».",
+            reply_markup=main_menu(False)
+        )
+        return
+
+    active = db.is_subscribed(callback.from_user.id)
+    until = datetime.fromisoformat(user[2]).strftime("%d.%m.%Y %H:%M")
+
+    text = (
+        f"👤 **Профиль**\n\n"
+        f"🆔 ID: `{callback.from_user.id}`\n"
+        f"📅 Подписка до: `{until}`\n"
+        f"Статус: {'✅ активна' if active else '❌ истекла'}\n"
+        f"💰 Всего оплачено: `{user[3]} TON`"
+    )
+
+    await callback.message.edit_text(
+        text, reply_markup=main_menu(active), parse_mode="Markdown"
+    )
+
+
+@dp.callback_query(F.data == "back")
+async def back(callback: CallbackQuery):
+    active = db.is_subscribed(callback.from_user.id)
+    text = f"👋 Привет, {callback.from_user.full_name}!\n\nВыберите действие 👇"
+    await callback.message.edit_text(
+        text, reply_markup=main_menu(active), parse_mode="Markdown"
+    )
+
+
+# ────────────────────────────────────────────────
+# Автопроверка платежей в фоне
+# ────────────────────────────────────────────────
+async def auto_check_loop():
+    while True:
+        try:
+            await asyncio.sleep(config.AUTO_CHECK_INTERVAL)
+            if config.AUTO_CHECK_INTERVAL <= 0:
+                continue
+
+            pending = db.get_pending_users()
+            for user_id in pending:
+                payment = await find_user_payment(user_id)
+                if not payment:
+                    continue
+
+                # Активируем без участия пользователя
+                tx_hash = payment["hash"]
+                amount = payment["amount_ton"]
+                db.save_payment(user_id, amount, tx_hash)
+                until = db.activate_subscription(
+                    user_id, "auto", config.SUBSCRIPTION_DAYS, amount
+                )
+                db.remove_pending(user_id)
+
+                # Уведомляем пользователя
+                try:
+                    text = (
+                        f"✅ **Оплата получена!**\n\n"
+                        f"💰 Сумма: `{amount} TON`\n"
+                        f"📅 Подписка активна до: `{until.strftime('%d.%m.%Y %H:%M')}`\n"
+                        f"🔗 TX: `{tx_hash[:20]}...`\n\n"
+                    )
+                    if config.SUBSCRIBER_CHANNEL_LINK:
+                        text += f"👉 Ссылка на закрытый канал:\n{config.SUBSCRIBER_CHANNEL_LINK}"
+                    else:
+                        text += "Спасибо за покупку! 🎉"
+
+                    await bot.send_message(
+                        user_id, text,
+                        reply_markup=main_menu(True),
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    logging.warning(f"Не удалось уведомить {user_id}: {e}")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logging.error(f"Ошибка в auto_check_loop: {e}")
+            await asyncio.sleep(10)
+
+
+# ────────────────────────────────────────────────
+# Запуск
+# ────────────────────────────────────────────────
+async def main():
+    db.init_db()
+    logging.info("🤖 Бот запущен")
+    logging.info(f"📍 Приём платежей: {config.TONKEEPER_ADDRESS}")
+    logging.info(f"💰 Цена подписки: {config.SUBSCRIPTION_PRICE:g} TON")
+    logging.info(f"⏱️  Автопроверка: каждые {config.AUTO_CHECK_INTERVAL} сек")
+
+    if config.AUTO_CHECK_INTERVAL > 0:
+        asyncio.create_task(auto_check_loop())
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
