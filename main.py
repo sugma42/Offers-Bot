@@ -38,7 +38,9 @@ async def fetch_transactions(limit: int = 30):
         headers["X-API-Key"] = config.TONCENTER_API_KEY
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(TONCENTER_URL, params=params, headers=headers, timeout=15) as resp:
+        async with session.get(
+            TONCENTER_URL, params=params, headers=headers, timeout=15
+        ) as resp:
             data = await resp.json()
 
     if not data.get("ok"):
@@ -103,7 +105,10 @@ def main_menu(is_active: bool = False):
     if is_active:
         kb.button(text="🔄 Продлить подписку", callback_data="buy_sub")
     else:
-        kb.button(text=f"💎 Купить подписку ({config.SUBSCRIPTION_PRICE:g} TON)", callback_data="buy_sub")
+        kb.button(
+            text=f"💎 Купить подписку ({config.SUBSCRIPTION_PRICE:g} TON)",
+            callback_data="buy_sub"
+        )
     kb.button(text="👤 Мой профиль", callback_data="profile")
     kb.adjust(1)
     return kb.as_markup()
@@ -273,7 +278,6 @@ async def auto_check_loop():
                 if not payment:
                     continue
 
-                # Активируем без участия пользователя
                 tx_hash = payment["hash"]
                 amount = payment["amount_ton"]
                 db.save_payment(user_id, amount, tx_hash)
@@ -282,7 +286,6 @@ async def auto_check_loop():
                 )
                 db.remove_pending(user_id)
 
-                # Уведомляем пользователя
                 try:
                     text = (
                         f"✅ **Оплата получена!**\n\n"
@@ -319,6 +322,7 @@ async def main():
     logging.info(f"📍 Приём платежей: {config.TONKEEPER_ADDRESS}")
     logging.info(f"💰 Цена подписки: {config.SUBSCRIPTION_PRICE:g} TON")
     logging.info(f"⏱️  Автопроверка: каждые {config.AUTO_CHECK_INTERVAL} сек")
+    logging.info(f"🗄️  База данных: {config.DB_PATH}")
 
     if config.AUTO_CHECK_INTERVAL > 0:
         asyncio.create_task(auto_check_loop())
