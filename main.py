@@ -2,11 +2,15 @@ import asyncio
 import logging
 import time
 from datetime import datetime
+from urllib.parse import urlencode
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import config
@@ -22,6 +26,30 @@ dp = Dispatcher()
 
 PRICE_NANO = int(config.SUBSCRIPTION_PRICE * 1_000_000_000)
 TONCENTER_URL = "https://toncenter.com/api/v2/getTransactions"
+
+
+# ────────────────────────────────────────────────
+# Генерация ссылок на Tonkeeper
+# ────────────────────────────────────────────────
+def tonkeeper_link(user_id: int) -> str:
+    """
+    Универсальная ссылка: открывает Tonkeeper (или другой TON-кошелёк)
+    с уже заполненными адресом, суммой и комментарием.
+    """
+    query = urlencode({
+        "amount": PRICE_NANO,
+        "text": str(user_id),
+    })
+    return f"https://app.tonkeeper.com/transfer/{config.TONKEEPER_ADDRESS}?{query}"
+
+
+def ton_native_link(user_id: int) -> str:
+    """Резервная ссылка в формате ton:// (для старых клиентов)."""
+    query = urlencode({
+        "amount": PRICE_NANO,
+        "text": str(user_id),
+    })
+    return f"ton://transfer/{config.TONKEEPER_ADDRESS}?{query}"
 
 
 # ────────────────────────────────────────────────
@@ -49,16 +77,9 @@ async def fetch_transactions(limit: int = 30):
 
 
 # ────────────────────────────────────────────────
-# Поиск платежа конкретного пользователя
+# Поиск платежа пользователя
 # ────────────────────────────────────────────────
 async def find_user_payment(user_id: int, max_age_seconds: int = 3600):
-    """
-    Ищет входящую транзакцию на адрес Tonkeeper:
-    - сумма >= 5 TON
-    - комментарий == str(user_id)
-    - не старше max_age_seconds
-    - ещё не использованная
-    """
     try:
         txs = await fetch_transactions()
     except Exception as e:
@@ -114,11 +135,27 @@ def main_menu(is_active: bool = False):
     return kb.as_markup()
 
 
-def pay_menu():
+def pay_menu(user_id: int):
+    """Кнопка «Оплатить в Tonkeeper» + «Подтвердить оплату»."""
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Я оплатил — проверить", callback_data="check_payment")
-    kb.button(text="⬅️ Назад", callback_data="back")
-    kb.adjust(1)
+    kb.row(
+        InlineKeyboardButton(
+            text="💎 Оплатить в Tonkeeper",
+            url=tonkeeper_link(user_id)
+        )
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="✅ Я оплатил — подтвердить",
+            callback_data="check_payment"
+        )
+    )
+    kb.row(
+        InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data="back"
+        )
+    )
     return kb.as_markup()
 
 
@@ -153,26 +190,27 @@ async def buy_sub(callback: CallbackQuery):
     text = (
         f"💎 **Подписка на {config.SUBSCRIPTION_DAYS} дней**\n\n"
         f"💰 Стоимость: **{config.SUBSCRIPTION_PRICE:g} TON**\n\n"
-        f"📤 **Как оплатить:**\n"
-        f"1. Откройте кошелёк **Tonkeeper** (или любой TON-кошелёк)\n"
-        f"2. Переведите ровно **{config.SUBSCRIPTION_PRICE:g} TON** на адрес:\n"
+        f"👇 **Нажмите кнопку «Оплатить в Tonkeeper»** — приложение откроется "
+        f"с уже заполненными адресом, суммой и комментарием.\n\n"
+        f"Если у вас не установлен Tonkeeper, откройте ссылку вручную:\n"
         f"`{config.TONKEEPER_ADDRESS}`\n\n"
-        f"3. В поле **«Комментарий»** обязательно укажите ваш ID:\n"
-        f"`{user_id}`\n\n"
-        f"⚠️ **Без комментария бот не сможет найти ваш платёж!**\n\n"
-        f"После отправки нажмите «Я оплатил» и подождите ~30 секунд, "
-        f"пока транзакция подтвердится в сети."
+        f"**Обязательно оставьте комментарий:** `{user_id}`\n"
+        f"_(он подставится автоматически)_\n\n"
+        f"После оплаты вернитесь в бота и нажмите **«Я оплатил — подтвердить»**.\n\n"
+        f"⚠️ Без комментария `{user_id}` бот не сможет найти ваш платёж!"
     )
 
     db.add_pending(user_id)
 
     await callback.message.edit_text(
-        text, reply_markup=pay_menu(), parse_mode="Markdown"
+        text,
+        reply_markup=pay_menu(user_id),
+        parse_mode="Markdown",
+        disable_web_page_preview=True
     )
 
 
 async def process_payment(user_id: int, username: str):
-    """Проверяет платёж и активирует подписку. Возвращает (успех, текст)."""
     payment = await find_user_payment(user_id)
 
     if not payment:
@@ -183,7 +221,7 @@ async def process_payment(user_id: int, username: str):
             f"• Комментарий к переводу — `{user_id}`\n"
             f"• Прошло ли хотя бы 30 секунд с момента отправки\n"
             f"• Адрес получателя: `{config.TONKEEPER_ADDRESS}`\n\n"
-            "Если всё верно — подождите минуту и нажмите «Проверить» ещё раз."
+            "Если всё верно — подождите минуту и нажмите «Подтвердить» ещё раз."
         )
 
     tx_hash = payment["hash"]
@@ -219,11 +257,19 @@ async def check_payment(callback: CallbackQuery):
 
     ok, text = await process_payment(user_id, username)
 
-    await callback.message.edit_text(
-        text,
-        reply_markup=main_menu(ok) if ok else pay_menu(),
-        parse_mode="Markdown"
-    )
+    if ok:
+        await callback.message.edit_text(
+            text,
+            reply_markup=main_menu(True),
+            parse_mode="Markdown"
+        )
+    else:
+        await callback.message.edit_text(
+            text,
+            reply_markup=pay_menu(user_id),
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
 
 
 @dp.callback_query(F.data == "profile")
@@ -322,7 +368,7 @@ async def main():
     logging.info(f"📍 Приём платежей: {config.TONKEEPER_ADDRESS}")
     logging.info(f"💰 Цена подписки: {config.SUBSCRIPTION_PRICE:g} TON")
     logging.info(f"⏱️  Автопроверка: каждые {config.AUTO_CHECK_INTERVAL} сек")
-    logging.info(f"🗄️  База данных: {config.DB_PATH}")
+    logging.info(f"🗄️  База данных: {db.DB_NAME}")
 
     if config.AUTO_CHECK_INTERVAL > 0:
         asyncio.create_task(auto_check_loop())
