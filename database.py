@@ -1,28 +1,59 @@
 import os
 import sqlite3
+import logging
 from datetime import datetime, timedelta
 
 import config
 
-DB_NAME = config.DB_PATH
+log = logging.getLogger(__name__)
+
+_CANDIDATES = [
+    config.DB_PATH,
+    "/data/bot.db",
+    "/app/data/bot.db",
+    "./data/bot.db",
+    "./bot.db",
+    "/tmp/bot.db",
+]
 
 
-def _ensure_dir():
-    """Создаёт папку для БД, если её нет (например, /data)."""
-    folder = os.path.dirname(os.path.abspath(DB_NAME))
-    if folder and not os.path.exists(folder):
-        try:
+def _try_open(path: str) -> bool:
+    if not path:
+        return False
+    try:
+        folder = os.path.dirname(os.path.abspath(path))
+        if folder:
             os.makedirs(folder, exist_ok=True)
-        except Exception as e:
-            print(f"⚠️ Не удалось создать папку {folder}: {e}")
+
+        conn = sqlite3.connect(path, timeout=5)
+        conn.execute("CREATE TABLE IF NOT EXISTS _probe (id INTEGER)")
+        conn.execute("DROP TABLE IF EXISTS _probe")
+        conn.close()
+        return True
+    except Exception as e:
+        log.warning(f"⚠️ Путь '{path}' недоступен: {e}")
+        return False
+
+
+def _resolve_db_path() -> str:
+    for path in _CANDIDATES:
+        if _try_open(path):
+            log.info(f"✅ База данных будет сохранена: {path}")
+            return path
+    raise RuntimeError(
+        "❌ Не удалось найти папку для БД. Включите постоянный диск /data "
+        "в панели хостинга или укажите DB_PATH в .env"
+    )
+
+
+DB_NAME = _resolve_db_path()
 
 
 def _conn():
-    return sqlite3.connect(DB_NAME)
+    return sqlite3.connect(DB_NAME, timeout=10)
 
 
 def init_db():
-    _ensure_dir()
     conn = _conn()
     cur = conn.cursor()
     cur.execute("""
