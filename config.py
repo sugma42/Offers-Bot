@@ -11,6 +11,9 @@ TONCENTER_API_KEY = os.getenv("TONCENTER_API_KEY", "").strip()
 SUBSCRIBER_CHANNEL_LINK = os.getenv("SUBSCRIBER_CHANNEL_LINK", "").strip()
 AUTO_CHECK_INTERVAL = int(os.getenv("AUTO_CHECK_INTERVAL", "60"))
 
+# Путь к базе данных (на хостинге — /data/bot.db)
+DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
+
 if not BOT_TOKEN or BOT_TOKEN.startswith("ВСТАВЬТЕ"):
     raise ValueError("❌ Укажите BOT_TOKEN в файле .env")
 if not TONKEEPER_ADDRESS:
