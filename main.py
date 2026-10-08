@@ -5,13 +5,15 @@ from datetime import datetime
 from urllib.parse import urlencode
 
 import aiohttp
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import (
     Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    TelegramObject
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from typing import Callable, Dict, Any, Awaitable
 
 import config
 import database as db
@@ -29,13 +31,61 @@ TONCENTER_URL = "https://toncenter.com/api/v2/getTransactions"
 
 
 # ────────────────────────────────────────────────
-# Генерация ссылок на Tonkeeper
+# MIDDLEWARE ДЛЯ ЛОГИРОВАНИЯ НАЖАТИЙ И СООБЩЕНИЙ
+# ────────────────────────────────────────────────
+class LoggingMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        if isinstance(event, CallbackQuery):
+            user = event.from_user
+            username = f"@{user.username}" if user.username else user.full_name
+            logging.info(
+                f"🖱️ НАЖАТИЕ | user_id={user.id} | {username} | "
+                f"кнопка='{event.data}' | сообщение_id={event.message.message_id}"
+            )
+        elif isinstance(event, Message):
+            user = event.from_user
+            username = f"@{user.username}" if user.username else user.full_name
+            text = (event.text or "").replace("\n", " ")[:100]
+            logging.info(
+                f"💬 СООБЩЕНИЕ | user_id={user.id} | {username} | текст='{text}'"
+            )
+        return await handler(event, data)
+
+
+dp.message.middleware(LoggingMiddleware())
+dp.callback_query.middleware(LoggingMiddleware())
+
+
+# ────────────────────────────────────────────────
+# ЗАЩИТА ОТ RATE LIMIT
+# ────────────────────────────────────────────────
+_last_request_time = 0.0
+_rate_lock = asyncio.Lock()
+
+
+async def _rate_limited_get(url, params, headers, timeout=15):
+    global _last_request_time
+    async with _rate_lock:
+        now = time.monotonic()
+        elapsed = now - _last_request_time
+        if elapsed < 1.2:
+            await asyncio.sleep(1.2 - elapsed)
+        _last_request_time = time.monotonic()
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params, headers=headers, timeout=timeout) as resp:
+            return resp.status, await resp.json()
+
+
+# ────────────────────────────────────────────────
+# Генерация ссылки на Tonkeeper
 # ────────────────────────────────────────────────
 def tonkeeper_link(user_id: int) -> str:
-    """
-    Универсальная ссылка: открывает Tonkeeper (или другой TON-кошелёк)
-    с уже заполненными адресом, суммой и комментарием.
-    """
     query = urlencode({
         "amount": PRICE_NANO,
         "text": str(user_id),
@@ -43,17 +93,8 @@ def tonkeeper_link(user_id: int) -> str:
     return f"https://app.tonkeeper.com/transfer/{config.TONKEEPER_ADDRESS}?{query}"
 
 
-def ton_native_link(user_id: int) -> str:
-    """Резервная ссылка в формате ton:// (для старых клиентов)."""
-    query = urlencode({
-        "amount": PRICE_NANO,
-        "text": str(user_id),
-    })
-    return f"ton://transfer/{config.TONKEEPER_ADDRESS}?{query}"
-
-
 # ────────────────────────────────────────────────
-# Получение транзакций адреса Tonkeeper
+# Получение транзакций
 # ────────────────────────────────────────────────
 async def fetch_transactions(limit: int = 30):
     params = {
@@ -65,15 +106,31 @@ async def fetch_transactions(limit: int = 30):
     if config.TONCENTER_API_KEY:
         headers["X-API-Key"] = config.TONCENTER_API_KEY
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            TONCENTER_URL, params=params, headers=headers, timeout=15
-        ) as resp:
-            data = await resp.json()
+    for attempt in range(3):
+        try:
+            status, data = await _rate_limited_get(TONCENTER_URL, params, headers)
 
-    if not data.get("ok"):
-        raise RuntimeError(f"TonCenter error: {data}")
-    return data.get("result", [])
+            if status == 429:
+                wait = 2 ** attempt
+                logging.warning(
+                    f"⚠️ TonCenter rate limit (429). "
+                    f"Повтор через {wait} сек... (попытка {attempt + 1}/3)"
+                )
+                await asyncio.sleep(wait)
+                continue
+
+            if not data.get("ok"):
+                raise RuntimeError(f"TonCenter error: {data}")
+
+            return data.get("result", [])
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logging.warning(f"⚠️ Сетевая ошибка: {e}. Повтор...")
+            await asyncio.sleep(2 ** attempt)
+            continue
+
+    logging.error("❌ TonCenter недоступен после 3 попыток")
+    return []
 
 
 # ────────────────────────────────────────────────
@@ -136,7 +193,6 @@ def main_menu(is_active: bool = False):
 
 
 def pay_menu(user_id: int):
-    """Кнопка «Оплатить в Tonkeeper» + «Подтвердить оплату»."""
     kb = InlineKeyboardBuilder()
     kb.row(
         InlineKeyboardButton(
@@ -312,11 +368,11 @@ async def back(callback: CallbackQuery):
 # Автопроверка платежей в фоне
 # ────────────────────────────────────────────────
 async def auto_check_loop():
+    await asyncio.sleep(30)
+
     while True:
         try:
-            await asyncio.sleep(config.AUTO_CHECK_INTERVAL)
-            if config.AUTO_CHECK_INTERVAL <= 0:
-                continue
+            await asyncio.sleep(max(config.AUTO_CHECK_INTERVAL, 90))
 
             pending = db.get_pending_users()
             for user_id in pending:
@@ -356,7 +412,7 @@ async def auto_check_loop():
             break
         except Exception as e:
             logging.error(f"Ошибка в auto_check_loop: {e}")
-            await asyncio.sleep(10)
+            await asyncio.sleep(15)
 
 
 # ────────────────────────────────────────────────
@@ -367,7 +423,7 @@ async def main():
     logging.info("🤖 Бот запущен")
     logging.info(f"📍 Приём платежей: {config.TONKEEPER_ADDRESS}")
     logging.info(f"💰 Цена подписки: {config.SUBSCRIPTION_PRICE:g} TON")
-    logging.info(f"⏱️  Автопроверка: каждые {config.AUTO_CHECK_INTERVAL} сек")
+    logging.info(f"⏱️  Автопроверка: каждые {max(config.AUTO_CHECK_INTERVAL, 90)} сек")
     logging.info(f"🗄️  База данных: {db.DB_NAME}")
 
     if config.AUTO_CHECK_INTERVAL > 0:
